@@ -89,6 +89,13 @@ VISION_END_TOKEN_ID = 151653   # <|vision_end|>
 VIDEO_PAD_TOKEN_ID = 151656    # <|video_pad|>
 IMAGE_PAD_TOKEN_ID = 151655    # <|image_pad|>
 
+# Client message types (C->S)
+VIDEO_TYPE = 1
+AUDIO_TYPE = 2
+CLEAR_CONTEXT_TYPE = 4
+START_CAMERA_TYPE = 6
+TEXT_PROMPT_TYPE = 11
+
 
 def detect_model_type(model_path: str) -> str:
     """根据模型路径判断模型类型: 'omni' 或 'vl'"""
@@ -2080,7 +2087,7 @@ async def handle_client_connection_async(conn, addr, args):
             # Avoids event loop starvation that causes ~800ms TTFT delay.
             await asyncio.sleep(0)
 
-            if file_type == 1:  # Video (WebM)
+            if file_type == VIDEO_TYPE:  # Video (WebM)
                 # Sanity check: WebM files need a minimum size for valid EBML header
                 # A valid WebM file is typically at least 1KB even for short clips
                 MIN_WEBM_SIZE = 1000  # 1KB minimum
@@ -2203,7 +2210,7 @@ async def handle_client_connection_async(conn, addr, args):
                 else:
                     print("❌ Video processing failed - no frames extracted (possible codec incompatibility with iOS Chrome)")
 
-            elif file_type == 2:  # Audio
+            elif file_type == AUDIO_TYPE:  # Audio
                 # Save audio for ASR
                 audio_path = os.path.join(AUDIO_DIR, "latest.mp3")
                 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -2247,7 +2254,27 @@ async def handle_client_connection_async(conn, addr, args):
                 # If frames are already there, we could trigger here, but to avoid race conditions
                 # we let the video loop handle it.
 
-            elif file_type == 4:  # Clear Context
+            elif file_type == TEXT_PROMPT_TYPE:  # Text prompt (ASR-free interaction)
+                try:
+                    text_prompt = file_data.decode("utf-8", errors="ignore").strip()
+                except Exception:
+                    text_prompt = ""
+
+                if not text_prompt:
+                    print("⚠ Received empty text prompt, ignoring")
+                    continue
+
+                last_prompt = text_prompt
+                print(f"📝 Set prompt from Text message: {last_prompt[:80]}...")
+                send_asr_query_to_client(text_prompt)
+
+                # If we already have accumulated video frames, prioritize this prompt.
+                if accumulated_video_frames and session.is_generating and session.is_auto_generating:
+                    if session.current_task and not session.current_task.done():
+                        print("🛑 Interrupting auto-generation for user text prompt!")
+                        session.current_task.cancel()
+
+            elif file_type == CLEAR_CONTEXT_TYPE:  # Clear Context
                 print("🗑 Clearing context...")
                 # Cancel any running generation task first
                 if session.current_task and not session.current_task.done():
@@ -2261,7 +2288,7 @@ async def handle_client_connection_async(conn, addr, args):
                 accumulated_video_frames = []
                 last_prompt = ""
 
-            elif file_type == 6:  # Start Camera
+            elif file_type == START_CAMERA_TYPE:  # Start Camera
                 print("📷 Camera started, resetting state...")
                 # Cancel any running generation task first
                 if session.current_task and not session.current_task.done():
