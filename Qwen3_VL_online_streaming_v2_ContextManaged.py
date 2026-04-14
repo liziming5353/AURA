@@ -1595,26 +1595,43 @@ async def init_async_engine(args) -> AsyncLLM:
 
     engine_kwargs["cudagraph_capture_sizes"] = [1,2,4]
 
-    engine_args = AsyncEngineArgs(**engine_kwargs)
-
-    model_label = "Qwen3 Omni" if detect_model_type(args.model) == "omni" else "Qwen3 VL"
+    model_type = detect_model_type(args.model)
+    model_label = "Qwen3 Omni" if model_type == "omni" else "Qwen3 VL"
     print(f"🚀 Initializing {model_label} AsyncLLM engine with model: {args.model}")
     print(f"   trust_remote_code={engine_kwargs['trust_remote_code']}, SILENT_TOKEN_ID={SILENT_TOKEN_ID}")
+
+    def _create_async_engine(kwargs: dict) -> AsyncLLM:
+        return AsyncLLM.from_engine_args(AsyncEngineArgs(**kwargs))
+
     try:
-        async_engine = AsyncLLM.from_engine_args(engine_args)
+        async_engine = _create_async_engine(engine_kwargs)
     except Exception as e:
         err = str(e)
+        remote_code_type_mismatch = (
+            engine_kwargs.get("trust_remote_code", False)
+            and "Invalid type of HuggingFace config" in err
+            and "Qwen3VLConfig" in err
+            and "transformers_modules" in err
+        )
         can_retry_with_remote_code = (
+            model_type == "omni"
+            and
             not engine_kwargs.get("trust_remote_code", False)
             and "failed to be inspected" in err
         )
 
-        if can_retry_with_remote_code:
+        if remote_code_type_mismatch:
+            print("⚠️ Qwen3-VL config type mismatch detected under trust_remote_code=True.")
+            print("   Retrying with trust_remote_code=False ...")
+            retry_kwargs = dict(engine_kwargs)
+            retry_kwargs["trust_remote_code"] = False
+            async_engine = _create_async_engine(retry_kwargs)
+            engine_kwargs = retry_kwargs
+        elif can_retry_with_remote_code:
             print("⚠️ Model inspection failed with trust_remote_code=False, retrying with trust_remote_code=True...")
             retry_kwargs = dict(engine_kwargs)
             retry_kwargs["trust_remote_code"] = True
-            retry_args = AsyncEngineArgs(**retry_kwargs)
-            async_engine = AsyncLLM.from_engine_args(retry_args)
+            async_engine = _create_async_engine(retry_kwargs)
             engine_kwargs = retry_kwargs
         else:
             if "failed to be inspected" in err:
@@ -1623,6 +1640,9 @@ async def init_async_engine(args) -> AsyncLLM:
                 print("   1) vLLM/transformers versions match README (vllm>=0.17.1, transformers>=4.57).")
                 print("   2) Model path points to a complete HF repo with config.json and modeling files.")
                 print("   3) Required custom code dependencies are installed.")
+            if "Invalid type of HuggingFace config" in err and "Qwen3VLConfig" in err:
+                print("❌ Qwen3-VL config type mismatch detected.")
+                print("   For Qwen3-VL, keep trust_remote_code=False to use transformers native classes.")
             raise
     print(f"✅ {model_label} AsyncLLM engine initialized successfully")
 
