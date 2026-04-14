@@ -1560,13 +1560,15 @@ async def init_async_engine(args) -> AsyncLLM:
     """Initialize the AsyncLLM engine with streaming support."""
     global async_engine
 
+    initial_trust_remote_code = detect_model_type(args.model) == "omni"
+
     # Build engine args dict, only include non-None values
     engine_kwargs = {
         "model": args.model,
         "tensor_parallel_size": args.tensor_parallel_size,
         "pipeline_parallel_size": args.pipeline_parallel_size,
         "max_model_len": args.max_model_len,
-        "trust_remote_code": detect_model_type(args.model) == "omni",
+        "trust_remote_code": initial_trust_remote_code,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "enforce_eager": args.enforce_eager,
         "limit_mm_per_prompt": {"image": args.max_images_per_prompt},
@@ -1598,7 +1600,30 @@ async def init_async_engine(args) -> AsyncLLM:
     model_label = "Qwen3 Omni" if detect_model_type(args.model) == "omni" else "Qwen3 VL"
     print(f"🚀 Initializing {model_label} AsyncLLM engine with model: {args.model}")
     print(f"   trust_remote_code={engine_kwargs['trust_remote_code']}, SILENT_TOKEN_ID={SILENT_TOKEN_ID}")
-    async_engine = AsyncLLM.from_engine_args(engine_args)
+    try:
+        async_engine = AsyncLLM.from_engine_args(engine_args)
+    except Exception as e:
+        err = str(e)
+        can_retry_with_remote_code = (
+            not engine_kwargs.get("trust_remote_code", False)
+            and "failed to be inspected" in err
+        )
+
+        if can_retry_with_remote_code:
+            print("⚠️ Model inspection failed with trust_remote_code=False, retrying with trust_remote_code=True...")
+            retry_kwargs = dict(engine_kwargs)
+            retry_kwargs["trust_remote_code"] = True
+            retry_args = AsyncEngineArgs(**retry_kwargs)
+            async_engine = AsyncLLM.from_engine_args(retry_args)
+            engine_kwargs = retry_kwargs
+        else:
+            if "failed to be inspected" in err:
+                print("❌ Model architecture inspection failed.")
+                print("   Please verify:")
+                print("   1) vLLM/transformers versions match README (vllm>=0.17.1, transformers>=4.57).")
+                print("   2) Model path points to a complete HF repo with config.json and modeling files.")
+                print("   3) Required custom code dependencies are installed.")
+            raise
     print(f"✅ {model_label} AsyncLLM engine initialized successfully")
 
     # Store tokenizer globally for CrossTurnPenalty
