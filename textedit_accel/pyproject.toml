@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "textedit-accel"
+version = "0.1.0"
+description = "OCR-guided semantic locking and selective token acceleration for diffusion text editing"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = [
+  "numpy>=1.26",
+  "Pillow>=10",
+  "torch>=2.2",
+]
+
+[project.optional-dependencies]
+qwen = [
+  "accelerate",
+  "diffusers>=0.37",
+  "protobuf",
+  "sentencepiece",
+  "transformers",
+]
+test = ["pytest>=8"]
+
+[project.scripts]
+textedit-accel = "textedit_accel.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

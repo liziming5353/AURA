@@ -310,6 +310,10 @@ Main inference parameters in `Qwen3_VL_online_streaming_v2_CM.sh`:
 └── Qwen3-TTS-streaming/                      # TTS model inference library
 ```
 
+## Experimental Subprojects
+
+- [`textedit_accel/`](textedit_accel/) — OCR-guided semantic locking and selective-token acceleration for diffusion-based image text editing.
+
 ## Troubleshooting
 
 | Issue | Solution |
