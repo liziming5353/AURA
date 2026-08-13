@@ -1,81 +1,254 @@
-# TextEdit Accel
+# Qwen-Image-Edit 单卡 H800 文字编辑加速
 
-面向扩散模型图像文字替换的推理加速实验项目。实现以下组合方案：
+本项目现已收窄到一个明确环境：
 
-1. **OCR 强制路由**：原文字框与估算后的目标文字框取并集，框内 token 永不被缓存或降分辨率。
-2. **SpecEdit 式 draft-and-verify**：先生成低分辨率编辑草稿，通过多尺度感知差异找出可能变化的 token。
-3. **SpotEdit 选择性计算**：将前两步的强制编辑 mask 注入官方 SpotEdit，其他区域继续使用 SpotSelector/SpotFusion。
-4. **动态分辨率核心**：提供细粒度 token 与粗粒度 token 的打包、坐标和恢复操作，供后续 Qwen/FLUX Transformer 原生适配。
+- 模型：`Qwen/Qwen-Image-Edit` 基础版
+- GPU：单张 NVIDIA H800 80GB
+- 精度：BF16，允许 TF32
+- 输入：单张约 1024×1024 图像
+- 任务：把一个或多个区域中的原文字替换为指定文字
 
-> 当前默认可运行路径是“语义草稿 + OCR guardrail + 官方 SpotEdit token skip”。`dynamic_resolution.py`
-> 已实现与模型无关的 mixed-resolution token 算法，但没有冒充已经完成的 Qwen/FLUX 内核：
-> 两个模型的 RoPE、joint attention、scheduler/noise 对齐均需单独适配。在完成该适配前，论文中的
-> SpecEdit 数倍动态分辨率收益不能视为已经复现。
+不支持 `Qwen-Image-Edit-2509/2511` 的 Plus pipeline，也不再提供 FLUX 入口。这样可以避免不同 pipeline、RoPE 和 latent packing 规则造成结果不可比。
 
-## 为什么采用组合方案
-
-纯 SpotEdit 对小范围编辑较稳，但加速通常约 1.6–2 倍。纯 SpecEdit 使用低分辨率草稿决定高分辨率区域，小字、标点和相似字符容易漏选。本项目把 OCR 区域设为不可跳过的硬约束，再用语义草稿补充 OCR 框之外的布局变化，最后交给 SpotEdit 保持背景和边界一致性。
-
-目标文字长度变化时，项目会根据字符视觉宽度估算目标框，并使用：
+## 已实现的推理路径
 
 ```text
-强制编辑区域 = dilate(原文字框 ∪ 目标文字估算框) ∪ 语义差异区域 ∪ 稀疏全局 token
+输入图像
+  ├─ OCR/手工文字框
+  │    └─ 原框 ∪ 目标文字估算框 ∪ padding
+  ├─ 低分辨率 Qwen 编辑草稿（每轴缩小 4 倍）
+  │    └─ Qwen VAE decoder 多层感知差异
+  └─ 强制编辑 token mask
+       └─ 官方 SpotEdit
+            ├─ mask 内始终完整计算
+            ├─ mask 外由 SpotSelector 决定复用
+            └─ SpotFusion 保持边界和背景上下文
 ```
 
-OCR 暂时只有接口；调用方可直接传框，因此不阻塞模型实验。
+最终强制计算区域为：
 
-## 安装
+```text
+dilate(原文字框 ∪ 目标文字估算框)
+∪ Qwen-VAE 语义差异区域
+∪ 稀疏全局稳定 token
+```
 
-Python 3.10+、PyTorch 2.2+。建议独立环境：
+这解决了纯 SpecEdit 对小字、标点和相似字形可能漏选的问题。即使低分辨率草稿没有识别出笔画差异，OCR 区域仍不会被缓存。
+
+## 当前完成度
+
+可以直接运行：
+
+- Qwen-Image-Edit 基础版加载；
+- 单 H800 BF16/TF32 配置和硬件校验；
+- H800 上原生 SDPA、FlashAttention 或 FlashAttention-3 后端选择；
+- 多文字框和长短文字替换；
+- Qwen VAE decoder `conv_in`、`mid_block`、首个 up block 感知差异；
+- 官方 SpotEdit 强制 ROI 注入；
+- 端到端延迟、峰值显存和 token 比例诊断；
+- baseline / OCR+SpotEdit / 完整 hybrid 三路 benchmark。
+
+尚未完成：
+
+- SpecEdit mixed-resolution token 序列尚未接入 Qwen Transformer；
+- OCR 检测模型暂时只有接口；
+- 字体、字号和目标排版引擎不在本项目范围。
+
+`dynamic_resolution.py` 已实现 mixed-resolution token 打包、位置坐标和恢复，但不能直接送入 Qwen Transformer。正式接入仍需处理 Qwen joint attention 的变长 RoPE 和 rectified-flow 噪声一致性，因此当前性能收益主要来自 SpotEdit token skip，而不是宣称复现了论文全部加速。
+
+## 环境安装
+
+建议 CUDA 12.x、Python 3.10+，只向进程暴露一张 H800：
 
 ```bash
-cd textedit_accel
-pip install -e ".[qwen,test]"
+export CUDA_VISIBLE_DEVICES=0
 
-# SpotEdit 未发布软件许可证，因此本项目不复制其代码，运行时使用独立 checkout。
+cd textedit_accel
+python -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -e ".[qwen,test]"
+```
+
+SpotEdit 没有发布明确的软件许可证，因此不复制其源代码，运行时使用独立 checkout：
+
+```bash
+mkdir -p third_party
 git clone https://github.com/Biangbiang0321/SpotEdit.git third_party/SpotEdit
 git -C third_party/SpotEdit checkout 85e3fda
 ```
 
-参考实现验证时使用的 SpotEdit 提交为 `85e3fda`。模型和显存要求参照 SpotEdit 上游说明；1024×1024 的 Qwen/FLUX 推理通常需要高显存 GPU。
-
-## 快速运行
-
-OCR 尚未接入时，通过 `--box '[x0,y0,x1,y1]'` 提供原文字框：
+FlashAttention 是可选项。它必须与当前 PyTorch、CUDA 和 Python ABI 匹配，不能随意安装不匹配的 wheel：
 
 ```bash
+# 安装与服务器环境匹配的 flash-attn wheel 后：
+textedit-accel ... --attention-backend flash
+```
+
+默认 `--attention-backend auto`：检测到 `flash_attn` 时使用 `flash`，否则使用 PyTorch 原生 SDPA。H800 是 Hopper 架构，但 `--attention-backend _flash_3` 只有在环境确实安装兼容 FlashAttention-3 时才应启用。
+
+## 单区域运行
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+
 textedit-accel \
-  --model Qwen/Qwen-Image-Edit \
   --spotedit-path third_party/SpotEdit \
-  --family qwen \
-  --image assets/sign.jpg \
+  --image assets/sign.png \
   --output outputs/sign-edited.png \
   --box '[120,220,600,330]' \
   --source-text 'OLD STORE' \
   --target-text '新人工智能体验中心' \
-  --prompt 'Replace "OLD STORE" with "新人工智能体验中心", preserve font style and background' \
+  --prompt 'Replace "OLD STORE" with "新人工智能体验中心". Preserve the original font style, perspective, lighting and background.' \
   --steps 50 \
-  --draft-steps 12
+  --draft-steps 12 \
+  --roi-padding 32 \
+  --attention-backend auto
 ```
 
-若要只测 OCR guardrail + SpotEdit：
+默认模型就是 `Qwen/Qwen-Image-Edit`。如果使用本地权重：
 
 ```bash
-textedit-accel ... --disable-draft
+textedit-accel --model /models/Qwen-Image-Edit ...
 ```
 
-Qwen-Image-Edit-2509/2511 使用不同的 Diffusers pipeline，应指定 `--family qwen_plus`。这与基础版 `Qwen/Qwen-Image-Edit` 不可混用。
+程序会拒绝非 H800 GPU。仅做兼容性调试时可以添加 `--no-strict-h800`，但仍要求 Hopper 9.x；该参数不代表其他 GPU 已经过性能验证。
+
+## 多区域文字替换
+
+按相同顺序重复 `--box`、`--source-text` 和 `--target-text`：
+
+```bash
+textedit-accel \
+  --spotedit-path third_party/SpotEdit \
+  --image assets/menu.png \
+  --output outputs/menu-edited.png \
+  --box '[80,120,420,210]' \
+  --source-text 'COFFEE' \
+  --target-text '咖啡' \
+  --box '[80,250,500,340]' \
+  --source-text 'DESSERT' \
+  --target-text '今日甜点' \
+  --prompt 'Replace "COFFEE" with "咖啡" and "DESSERT" with "今日甜点". Keep all other pixels and typography style unchanged.'
+```
+
+目标文字比原文长时，会按照字符视觉宽度扩展目标框。生产环境最好由排版模块直接通过 `TextRegion.metadata["target_box"]` 提供精确目标框。
+
+## 针对文字尺寸的配置
+
+### 小字、复杂中文、标点
+
+优先保证准确率：
+
+```bash
+--steps 50 \
+--draft-steps 12 \
+--roi-padding 40 \
+--semantic-quantile 0.70 \
+--uniform-stride 6 \
+--spot-threshold 0.12
+```
+
+较低的 semantic quantile 会选择更多差异 token；更大的 padding 为字形边缘、阴影和透视变形保留上下文。
+
+### 普通招牌或海报标题
+
+推荐平衡配置：
+
+```bash
+--steps 50 \
+--draft-steps 12 \
+--roi-padding 24 \
+--semantic-quantile 0.82 \
+--uniform-stride 8 \
+--spot-threshold 0.15
+```
+
+### 大字且编辑框明确
+
+可以先关闭草稿，测量 SpotEdit 本身：
+
+```bash
+--disable-draft --roi-padding 24
+```
+
+关闭草稿可能更快，但失去对文字框外布局变化的自动补充。不要在小字或目标文字明显变长时使用过小 padding。
+
+## H800 执行策略
+
+项目采用以下策略：
+
+- 模型、VAE 和文本编码组件全部驻留单张 H800；
+- 不启用 CPU offload，避免 PCIe 传输吞掉 token skip 收益；
+- 使用 BF16；
+- 开启 TF32 供仍使用 FP32 的矩阵运算；
+- batch size 固定为 1；
+- 不默认使用 `torch.compile`：SpotEdit 每步 token 数可能变化，容易触发多次重编译；
+- 每次正式测量前执行 CUDA synchronize；
+- 同时报告 wall-clock latency 和 `max_memory_allocated`。
+
+如果出现 OOM，应先确认没有其他进程占用显存，再减少分辨率或关闭 VAE 特征验证（`--pixel-verifier`）。不建议第一时间启用 sequential CPU offload。
+
+## Benchmark
+
+下面的命令在同一进程、同一模型、同一 seed 下比较：
+
+1. Qwen 原始完整推理；
+2. OCR 强制框 + SpotEdit；
+3. OCR + SpecEdit 式草稿验证 + SpotEdit。
+
+```bash
+textedit-benchmark-h800 \
+  --spotedit-path third_party/SpotEdit \
+  --image assets/sign.png \
+  --output-dir outputs/benchmark-sign \
+  --box '[120,220,600,330]' \
+  --source-text 'OLD STORE' \
+  --target-text '新人工智能体验中心' \
+  --prompt 'Replace "OLD STORE" with "新人工智能体验中心". Preserve everything else.' \
+  --steps 50 \
+  --draft-steps 12 \
+  --warmup 1 \
+  --repeats 3
+```
+
+输出包括三组图片以及 `benchmark.json`：
+
+```json
+{
+  "baseline": {
+    "median_seconds": 0,
+    "peak_memory_gib": 0
+  },
+  "spotedit_ocr": {
+    "median_seconds": 0,
+    "speedup": 0
+  },
+  "hybrid": {
+    "median_seconds": 0,
+    "speedup": 0
+  }
+}
+```
+
+不要直接引用论文中的 6× 或 10×。必须以这份 H800 benchmark 的实测 wall-clock 为准；草稿和 VAE 验证的时间都包含在 hybrid 结果中。
 
 ## Python API 与 OCR 接口
 
 ```python
-from textedit_accel import Box, EditRequest, HybridTextEditPipeline, TextRegion
+from textedit_accel import (
+    Box,
+    EditRequest,
+    HybridTextEditPipeline,
+    TextRegion,
+    configure_h800,
+    load_qwen_image_edit,
+)
 from textedit_accel.backends import SpotEditBackend
 from textedit_accel.ocr import OCRProvider
 
 class MyOCR(OCRProvider):
     def detect(self, image):
-        # 可接 PaddleOCR、TextSnake 或自有服务。
         return [
             TextRegion(
                 box=Box(120, 220, 600, 330),
@@ -84,101 +257,47 @@ class MyOCR(OCRProvider):
             )
         ]
 
+runtime = configure_h800()
+model = load_qwen_image_edit(runtime=runtime)
 backend = SpotEditBackend(
-    diffusers_pipeline,
+    model,
     spotedit_path="third_party/SpotEdit",
-    family="qwen",
+    attention_backend=runtime.attention_backend,
 )
 editor = HybridTextEditPipeline(backend, ocr=MyOCR())
 result = editor(EditRequest(
     image=input_image,
-    prompt='Replace the sign text with "新人工智能体验中心"',
+    prompt='Replace "OLD STORE" with "新人工智能体验中心"',
     target_text="新人工智能体验中心",
 ))
-result.image.save("output.png")
 ```
 
-也可以通过 `TextRegion.metadata["target_box"]` 提供排版引擎计算出的精确目标框，从而跳过长度启发式估计。
-
-## SpecEdit 部分实现
-
-### Preliminary draft
-
-`DiffusersDraftGenerator` 将图像每个轴缩小 4 倍，即将空间 token 数量降低约 16 倍，然后运行较短的完整去噪轨迹。草稿只参与区域验证，不作为正式轨迹的初始 latent。
-
-### Semantic verification
-
-`SemanticVerifier` 对原图和草稿计算归一化多尺度特征距离，再投影到模型 token 网格。默认实现不依赖特定 VAE；传入 `feature_extractor` 后可替换为论文使用的 VAE decoder 中间特征：
-
-```python
-verifier = SemanticVerifier(config, feature_extractor=my_vae_feature_extractor)
-```
-
-阈值由正差异 token 的分位数确定，并对 mask 膨胀；此外加入稀疏均匀 token，避免全局几何漂移。
-
-### Mixed-resolution token
-
-`dynamic_resolution.py` 实现：
-
-- 语义区域所在 coarse block 展开为全部 fine tokens；
-- 非编辑 block 以均值聚合成一个 coarse token；
-- 输出 `(y, x, scale)` 坐标供模型构造位置编码；
-- Transformer 更新后恢复完整 token 网格。
-
-示例：
-
-```python
-from textedit_accel.dynamic_resolution import build_plan, pack_tokens, restore_tokens
-
-plan = build_plan(edit_mask, coarse_factor=2, uniform_stride=8)
-packed = pack_tokens(tokens_bhwc, plan)
-updated = transformer_adapter(packed.tokens, packed.coordinates)
-packed.tokens = updated
-full_tokens = restore_tokens(packed)
-```
-
-模型适配器必须确保 coarse/fine token 使用正确的 RoPE 坐标，并在 rectified-flow 每一步保持噪声方差一致，不能简单把变长序列传给原始 Qwen/FLUX Transformer。
-
-## 配置建议
-
-| 参数 | 默认值 | 作用 |
-|---|---:|---|
-| `roi_padding` | 24 px | 文字框外高分辨率上下文 |
-| `draft_downsample` | 4/轴 | 草稿约 16× 空间 token 降低 |
-| `draft_steps` | 12 | 草稿去噪步数 |
-| `discrepancy_quantile` | 0.82 | 语义差异阈值 |
-| `dilation_radius` | 1 token | 扩张语义区域 |
-| `uniform_stride` | 8 tokens | 全局稳定采样 |
-| SpotEdit `reuse_mode` | `velocity` | 减少硬粘贴边界 |
-
-小字、中文复杂字形和标点建议增大 `roi_padding`，并由 OCR/排版引擎提供目标框。编辑面积较大时 SpotEdit 会自然退化为接近完整计算，这是正确的保质量行为。
+CLI 默认启用 Qwen VAE 感知验证。自行构建 Python API 时，可以组合 `QwenLowResolutionDraftGenerator`、`SemanticVerifier` 和 `QwenVAEFeatureExtractor`，方式参见 `cli.py`。Qwen 专用草稿适配器会同时降低生成流和条件图像流的 token 分辨率；只给原始 Diffusers pipeline 传较小的 `width/height` 并不能做到这一点。
 
 ## 测试
 
+不下载模型的单元测试：
+
 ```bash
-cd textedit_accel
 pip install -e ".[test]"
 pytest
+ruff check src tests
 ```
 
-单元测试不下载大模型，覆盖区域扩张、mask 投影、动态分辨率打包/恢复及组合流水线。真实模型评测还应报告：
+测试覆盖：
 
-- OCR exact match、CER/WER；
-- 编辑框内 LPIPS；
-- 编辑框外 PSNR/SSIM；
-- 字号、字符数量、编辑面积分桶后的 wall-clock latency；
-- 峰值显存和实际 token reuse ratio。
+- 长短文字目标框估算；
+- pixel mask 到 Qwen token grid 的保守映射；
+- mixed-resolution token 打包和恢复；
+- OCR 与语义 mask 合并；
+- Qwen VAE 三层特征提取；
+- 多文字框 CLI；
+- 注意力后端选择。
 
-## 已知边界
+真实评测还应报告 OCR exact match、CER/WER、编辑框内 LPIPS、编辑框外 PSNR/SSIM，并按照字号、字符数和编辑面积分桶。
 
-- 上游 SpotEdit 当前没有明确软件许可证，因此只做运行时桥接。
-- Diffusers 内部 API 变化可能影响 SpotEdit；请固定 SpotEdit 提交和已验证的 Diffusers 版本。
-- 默认图像多尺度差异是可移植近似；严格论文复现应实现对应模型的 VAE decoder feature extractor。
-- 当前没有 OCR 模型，也不负责字体识别和目标文字排版。
-- 多个文字框时，`target_text` 应传与框顺序一致的字符串列表。
-
-## 论文与代码
+## 参考
 
 - [SpotEdit paper](https://openaccess.thecvf.com/content/CVPR2026/papers/Qin_SpotEdit_Selective_Region_Editing_in_Diffusion_Transformers_CVPR_2026_paper.pdf)
 - [SpotEdit official implementation](https://github.com/Biangbiang0321/SpotEdit)
-- [SpecEdit: Training-Free Acceleration for Diffusion based Image Editing via Semantic Locking](https://arxiv.org/abs/2605.02152)
+- [SpecEdit image-editing paper](https://arxiv.org/abs/2605.02152)

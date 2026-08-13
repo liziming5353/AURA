@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -14,24 +15,9 @@ from textedit_accel.types import EditRequest
 
 _PATCH_LOCK = threading.RLock()
 
-_FAMILIES = {
-    "qwen": (
-        "Qwen_image_edit.qwen_spotedit",
-        "Qwen_image_edit.qwen_spot_ultis",
-    ),
-    "qwen_plus": (
-        "Qwen_image_edit_plus.qwen_plus_spotedit",
-        "Qwen_image_edit_plus.qwen_spot_ultis",
-    ),
-    "flux": (
-        "FLUX_kontext.flux_spotedit",
-        "FLUX_kontext.flux_spot_ultis",
-    ),
-}
-
 
 class SpotEditBackend(SelectiveEditBackend):
-    """Bridge to the official SpotEdit repository with a forced text ROI.
+    """Qwen-Image-Edit bridge to official SpotEdit with a forced text ROI.
 
     SpotEdit is loaded as an external dependency because its repository does not
     currently publish a software license. No upstream source is vendored here.
@@ -42,38 +28,30 @@ class SpotEditBackend(SelectiveEditBackend):
         pipeline,
         *,
         spotedit_path: str | Path,
-        family: str = "qwen",
         config_overrides: dict | None = None,
+        attention_backend: str | None = None,
     ):
-        if family not in _FAMILIES:
-            raise ValueError(
-                f"unsupported family {family!r}; choose from {tuple(_FAMILIES)}"
-            )
         path = Path(spotedit_path).expanduser().resolve()
         if not path.is_dir():
             raise FileNotFoundError(f"SpotEdit checkout not found: {path}")
         if str(path) not in sys.path:
             sys.path.insert(0, str(path))
 
-        generate_module, utils_module = _FAMILIES[family]
-        self.generate_module = importlib.import_module(generate_module)
-        self.utils_module = importlib.import_module(utils_module)
+        self.generate_module = importlib.import_module("Qwen_image_edit.qwen_spotedit")
+        self.utils_module = importlib.import_module("Qwen_image_edit.qwen_spot_ultis")
         self.pipeline = pipeline
-        self.family = family
         self.config = self.utils_module.SpotEditConfig(**(config_overrides or {}))
+        self.attention_backend = attention_backend
 
     def token_grid(self, request: EditRequest) -> tuple[int, int]:
         vae_scale = int(self.pipeline.vae_scale_factor)
-        if self.family.startswith("qwen"):
-            dimensions = self.generate_module.calculate_dimensions(
-                1024 * 1024, request.image.width / request.image.height
-            )
-            width, height = dimensions[:2]
-        else:
-            width = height = int(self.pipeline.default_sample_size) * vae_scale
+        dimensions = self.generate_module.calculate_dimensions(
+            1024 * 1024, request.image.width / request.image.height
+        )
+        width, height = dimensions[:2]
         multiple = vae_scale * 2
         width, height = width // multiple * multiple, height // multiple * multiple
-        # Qwen and current SpotEdit implementations pack 2x2 latent patches.
+        # Qwen-Image-Edit packs 2x2 VAE latent patches into one DiT token.
         return height // vae_scale // 2, width // vae_scale // 2
 
     def edit(
@@ -84,31 +62,33 @@ class SpotEditBackend(SelectiveEditBackend):
         grid = self.token_grid(request)
         force = _resize_mask(forced_edit_mask, grid)
         aux: dict = {}
+        device = getattr(self.pipeline, "_execution_device", "cpu")
+        generator = torch.Generator(device=device).manual_seed(request.seed)
         kwargs = {
             "image": request.image,
             "prompt": request.prompt,
+            "negative_prompt": request.negative_prompt,
             "num_inference_steps": request.num_inference_steps,
+            "generator": generator,
             "config": self.config,
             "aux": aux,
         }
-        if self.family.startswith("qwen"):
-            device = getattr(self.pipeline, "_execution_device", "cpu")
-            generator = torch.Generator(device=device).manual_seed(request.seed)
-            kwargs["negative_prompt"] = request.negative_prompt
-            kwargs["generator"] = generator
-        else:
-            # The official FLUX bridge does not expose a Generator argument.
-            torch.manual_seed(request.seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(request.seed)
-        with self._force_recompute(force):
+        cuda = torch.cuda.is_available() and str(device).startswith("cuda")
+        if cuda:
+            torch.cuda.synchronize(device)
+        started = time.perf_counter()
+        with self._force_recompute(force), self._attention_backend():
             output = self.generate_module.generate(self.pipeline, **kwargs)
+        if cuda:
+            torch.cuda.synchronize(device)
+        latency = time.perf_counter() - started
         diagnostics = {
             **aux,
             "forced_edit_tokens": int(force.sum()),
             "total_tokens": force.numel(),
             "forced_edit_ratio": float(force.float().mean()),
-            "spotedit_family": self.family,
+            "model_family": "Qwen/Qwen-Image-Edit",
+            "latency_seconds": latency,
         }
         return output.images[0], diagnostics
 
@@ -135,6 +115,17 @@ class SpotEditBackend(SelectiveEditBackend):
             finally:
                 setattr(self.utils_module, name, original_utils)
                 setattr(self.generate_module, name, original_generate)
+
+    @contextmanager
+    def _attention_backend(self):
+        processor = self.generate_module.QwenSpotEditAttnProcessor
+        previous = processor._attention_backend
+        if self.attention_backend is not None:
+            processor._attention_backend = self.attention_backend
+        try:
+            yield
+        finally:
+            processor._attention_backend = previous
 
 
 def _resize_mask(mask: torch.Tensor, grid: tuple[int, int]) -> torch.Tensor:

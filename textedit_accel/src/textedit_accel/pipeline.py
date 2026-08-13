@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import torch
 
 from textedit_accel.backends.base import SelectiveEditBackend
@@ -31,6 +33,10 @@ class HybridTextEditPipeline:
 
     @torch.no_grad()
     def __call__(self, request: EditRequest) -> EditResult:
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
+        started = time.perf_counter()
         detected = tuple(request.regions or self.ocr.detect(request.image))
         if not detected:
             raise ValueError(
@@ -74,6 +80,12 @@ class HybridTextEditPipeline:
 
         image, backend_diagnostics = self.backend.edit(request, forced_mask)
         diagnostics.update(backend_diagnostics)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            diagnostics["total_peak_memory_gib"] = (
+                torch.cuda.max_memory_allocated() / 2**30
+            )
+        diagnostics["total_latency_seconds"] = time.perf_counter() - started
         return EditResult(
             image=image,
             edit_mask=forced_mask.cpu(),

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "textedit-accel"
-version = "0.1.0"
-description = "OCR-guided semantic locking and selective token acceleration for diffusion text editing"
+version = "0.2.0"
+description = "Single-H800 acceleration for Qwen-Image-Edit text replacement"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -27,6 +27,7 @@ test = ["pytest>=8"]
 
 [project.scripts]
 textedit-accel = "textedit_accel.cli:main"
+textedit-benchmark-h800 = "textedit_accel.benchmark:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

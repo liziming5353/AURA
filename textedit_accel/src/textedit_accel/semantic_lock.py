@@ -125,37 +125,3 @@ class SemanticVerifier:
     def _tensor(image: Image.Image) -> torch.Tensor:
         array = np.asarray(image.convert("RGB"), dtype=np.float32).copy()
         return torch.from_numpy(array).permute(2, 0, 1).div_(255).unsqueeze(0)
-
-
-class DiffusersDraftGenerator:
-    """Portable low-resolution draft runner for Diffusers editing pipelines."""
-
-    def __init__(self, pipeline, downsample: int = 4):
-        self.pipeline = pipeline
-        self.downsample = downsample
-
-    @torch.no_grad()
-    def generate(
-        self,
-        image: Image.Image,
-        prompt: str,
-        *,
-        seed: int,
-        num_inference_steps: int,
-    ) -> Image.Image:
-        width, height = image.size
-        # Most VAE pipelines cannot run at literal 1/16 image size. Keep dimensions
-        # legal while still making the draft substantially cheaper.
-        draft_width = max(64, (width // self.downsample // 16) * 16)
-        draft_height = max(64, (height // self.downsample // 16) * 16)
-        device = getattr(self.pipeline, "_execution_device", "cpu")
-        generator = torch.Generator(device=device).manual_seed(seed)
-        output = self.pipeline(
-            image=image.resize((draft_width, draft_height), Image.Resampling.LANCZOS),
-            prompt=prompt,
-            width=draft_width,
-            height=draft_height,
-            num_inference_steps=num_inference_steps,
-            generator=generator,
-        )
-        return output.images[0]
