@@ -270,6 +270,65 @@ Open: `http://localhost:5003`
 
 </details>
 
+## Single-Server Streaming Demo (No ASR/TTS/Frontend)
+
+You can run the main model server and interact with it directly on one machine, without launching ASR, TTS, or Flask frontend.
+
+### 1) Start only the main inference server
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python -u Qwen3_VL_online_streaming_v2_ContextManaged.py \
+    --listen-port 12345 \
+    --model /path/to/AURA-or-Qwen3-VL \
+    --tensor-parallel-size 1 \
+    --max-model-len 262144 \
+    --max-seq-len 262144 \
+    --gpu-memory-utilization 0.9 \
+    --temperature 0.5 \
+    --max-tokens 128
+```
+
+Do not pass `--enable-tts` for this mode.
+
+### 2) Run the local interaction simulator
+
+```bash
+python single_server_streaming_demo.py \
+    --host 127.0.0.1 \
+    --port 12345 \
+    --video demos/Watch_the_kettle_for_me.mp4
+```
+
+What this script does:
+- Sends video payloads to the TCP server (Type 1)
+- Sends timed text questions (Type 11) to simulate ASR output
+- Prints streaming text tokens (Type 8) in real time
+- Simulates TTS playback locally by sentence timing (no TTS model required)
+
+### 3) Optional: customize timed interaction events
+
+Create a JSON file:
+
+```json
+[
+  {"at_s": 0.0, "kind": "start_camera"},
+  {"at_s": 0.4, "kind": "send_video"},
+  {"at_s": 1.8, "kind": "ask", "payload": "先描述你目前看到的画面。"},
+  {"at_s": 5.2, "kind": "send_video"},
+  {"at_s": 6.0, "kind": "ask", "payload": "如果水壶开始冒蒸汽，请马上提醒我。"}
+]
+```
+
+Then run:
+
+```bash
+python single_server_streaming_demo.py \
+    --host 127.0.0.1 \
+    --port 12345 \
+    --video demos/Watch_the_kettle_for_me.mp4 \
+    --scenario-json your_scenario.json
+```
+
 ## GPU Allocation Reference
 
 | GPU | Service | VRAM |

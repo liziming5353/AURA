@@ -89,6 +89,13 @@ VISION_END_TOKEN_ID = 151653   # <|vision_end|>
 VIDEO_PAD_TOKEN_ID = 151656    # <|video_pad|>
 IMAGE_PAD_TOKEN_ID = 151655    # <|image_pad|>
 
+# Client message types (C->S)
+VIDEO_TYPE = 1
+AUDIO_TYPE = 2
+CLEAR_CONTEXT_TYPE = 4
+START_CAMERA_TYPE = 6
+TEXT_PROMPT_TYPE = 11
+
 
 def detect_model_type(model_path: str) -> str:
     """根据模型路径判断模型类型: 'omni' 或 'vl'"""
@@ -1553,13 +1560,15 @@ async def init_async_engine(args) -> AsyncLLM:
     """Initialize the AsyncLLM engine with streaming support."""
     global async_engine
 
+    initial_trust_remote_code = detect_model_type(args.model) == "omni"
+
     # Build engine args dict, only include non-None values
     engine_kwargs = {
         "model": args.model,
         "tensor_parallel_size": args.tensor_parallel_size,
         "pipeline_parallel_size": args.pipeline_parallel_size,
         "max_model_len": args.max_model_len,
-        "trust_remote_code": detect_model_type(args.model) == "omni",
+        "trust_remote_code": initial_trust_remote_code,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "enforce_eager": args.enforce_eager,
         "limit_mm_per_prompt": {"image": args.max_images_per_prompt},
@@ -1586,12 +1595,55 @@ async def init_async_engine(args) -> AsyncLLM:
 
     engine_kwargs["cudagraph_capture_sizes"] = [1,2,4]
 
-    engine_args = AsyncEngineArgs(**engine_kwargs)
-
-    model_label = "Qwen3 Omni" if detect_model_type(args.model) == "omni" else "Qwen3 VL"
+    model_type = detect_model_type(args.model)
+    model_label = "Qwen3 Omni" if model_type == "omni" else "Qwen3 VL"
     print(f"🚀 Initializing {model_label} AsyncLLM engine with model: {args.model}")
     print(f"   trust_remote_code={engine_kwargs['trust_remote_code']}, SILENT_TOKEN_ID={SILENT_TOKEN_ID}")
-    async_engine = AsyncLLM.from_engine_args(engine_args)
+
+    def _create_async_engine(kwargs: dict) -> AsyncLLM:
+        return AsyncLLM.from_engine_args(AsyncEngineArgs(**kwargs))
+
+    try:
+        async_engine = _create_async_engine(engine_kwargs)
+    except Exception as e:
+        err = str(e)
+        remote_code_type_mismatch = (
+            engine_kwargs.get("trust_remote_code", False)
+            and "Invalid type of HuggingFace config" in err
+            and "Qwen3VLConfig" in err
+            and "transformers_modules" in err
+        )
+        can_retry_with_remote_code = (
+            model_type == "omni"
+            and
+            not engine_kwargs.get("trust_remote_code", False)
+            and "failed to be inspected" in err
+        )
+
+        if remote_code_type_mismatch:
+            print("⚠️ Qwen3-VL config type mismatch detected under trust_remote_code=True.")
+            print("   Retrying with trust_remote_code=False ...")
+            retry_kwargs = dict(engine_kwargs)
+            retry_kwargs["trust_remote_code"] = False
+            async_engine = _create_async_engine(retry_kwargs)
+            engine_kwargs = retry_kwargs
+        elif can_retry_with_remote_code:
+            print("⚠️ Model inspection failed with trust_remote_code=False, retrying with trust_remote_code=True...")
+            retry_kwargs = dict(engine_kwargs)
+            retry_kwargs["trust_remote_code"] = True
+            async_engine = _create_async_engine(retry_kwargs)
+            engine_kwargs = retry_kwargs
+        else:
+            if "failed to be inspected" in err:
+                print("❌ Model architecture inspection failed.")
+                print("   Please verify:")
+                print("   1) vLLM/transformers versions match README (vllm>=0.17.1, transformers>=4.57).")
+                print("   2) Model path points to a complete HF repo with config.json and modeling files.")
+                print("   3) Required custom code dependencies are installed.")
+            if "Invalid type of HuggingFace config" in err and "Qwen3VLConfig" in err:
+                print("❌ Qwen3-VL config type mismatch detected.")
+                print("   For Qwen3-VL, keep trust_remote_code=False to use transformers native classes.")
+            raise
     print(f"✅ {model_label} AsyncLLM engine initialized successfully")
 
     # Store tokenizer globally for CrossTurnPenalty
@@ -2080,7 +2132,7 @@ async def handle_client_connection_async(conn, addr, args):
             # Avoids event loop starvation that causes ~800ms TTFT delay.
             await asyncio.sleep(0)
 
-            if file_type == 1:  # Video (WebM)
+            if file_type == VIDEO_TYPE:  # Video (WebM)
                 # Sanity check: WebM files need a minimum size for valid EBML header
                 # A valid WebM file is typically at least 1KB even for short clips
                 MIN_WEBM_SIZE = 1000  # 1KB minimum
@@ -2203,7 +2255,7 @@ async def handle_client_connection_async(conn, addr, args):
                 else:
                     print("❌ Video processing failed - no frames extracted (possible codec incompatibility with iOS Chrome)")
 
-            elif file_type == 2:  # Audio
+            elif file_type == AUDIO_TYPE:  # Audio
                 # Save audio for ASR
                 audio_path = os.path.join(AUDIO_DIR, "latest.mp3")
                 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -2247,7 +2299,27 @@ async def handle_client_connection_async(conn, addr, args):
                 # If frames are already there, we could trigger here, but to avoid race conditions
                 # we let the video loop handle it.
 
-            elif file_type == 4:  # Clear Context
+            elif file_type == TEXT_PROMPT_TYPE:  # Text prompt (ASR-free interaction)
+                try:
+                    text_prompt = file_data.decode("utf-8", errors="ignore").strip()
+                except Exception:
+                    text_prompt = ""
+
+                if not text_prompt:
+                    print("⚠ Received empty text prompt, ignoring")
+                    continue
+
+                last_prompt = text_prompt
+                print(f"📝 Set prompt from Text message: {last_prompt[:80]}...")
+                send_asr_query_to_client(text_prompt)
+
+                # If we already have accumulated video frames, prioritize this prompt.
+                if accumulated_video_frames and session.is_generating and session.is_auto_generating:
+                    if session.current_task and not session.current_task.done():
+                        print("🛑 Interrupting auto-generation for user text prompt!")
+                        session.current_task.cancel()
+
+            elif file_type == CLEAR_CONTEXT_TYPE:  # Clear Context
                 print("🗑 Clearing context...")
                 # Cancel any running generation task first
                 if session.current_task and not session.current_task.done():
@@ -2261,7 +2333,7 @@ async def handle_client_connection_async(conn, addr, args):
                 accumulated_video_frames = []
                 last_prompt = ""
 
-            elif file_type == 6:  # Start Camera
+            elif file_type == START_CAMERA_TYPE:  # Start Camera
                 print("📷 Camera started, resetting state...")
                 # Cancel any running generation task first
                 if session.current_task and not session.current_task.done():
